@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cutoff=$(date -u -d "$MIN_AGE_HOURS hours ago" +%s)
+failed=0
+refs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/heads/run/" --jq '.[] | "\(.ref) \(.object.sha)"')
+while read -r ref sha; do
+  [ -n "$ref" ] || continue
+  branch=${ref#refs/heads/}
+  active=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?branch=$branch" \
+    --jq '[.workflow_runs[] | select(.status != "completed")] | length')
+  if [ "$active" != 0 ]; then
+    echo "keep $branch: a run is still using it"
+    continue
+  fi
+  pushed=$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$sha" --jq .committer.date)
+  if [ "$(date -u -d "$pushed" +%s)" -gt "$cutoff" ]; then
+    echo "keep $branch: pushed at $pushed"
+    continue
+  fi
+  echo "delete $branch: pushed at $pushed, no run using it"
+  # The run's own ci-status job may delete it first.
+  if ! out=$(gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/$ref" 2>&1); then
+    case "$out" in
+      *"(HTTP 404)"* | *"(HTTP 422)"*) ;;
+      *)
+        echo "$out"
+        failed=1
+        ;;
+    esac
+  fi
+done <<<"$refs"
+exit "$failed"

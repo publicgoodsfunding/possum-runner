@@ -1,0 +1,33 @@
+name: sweep
+
+# Deletes the run/* branches that ci.yml never got to delete: a dispatch that failed after the push, a run
+# force-cancelled or lost before its ci-status job, or a ci-status job whose checkout failed. Schedules run only on
+# main.
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: sweep
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Delete stale run branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Long enough for a branch pushed but not yet dispatched, or a run still queued for a runner.
+          MIN_AGE_HOURS: 6
+        run: '"$GITHUB_WORKSPACE/scripts/sweep.sh"'

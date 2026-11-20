@@ -1,0 +1,252 @@
+name: ci
+run-name: ci for ${{ inputs.possum-run }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: The www.prosperous.software commit to check out.
+        required: true
+        type: string
+      status-sha:
+        description: The www.prosperous.software commit to report ci-status on.
+        required: true
+        type: string
+      force:
+        description: Rebuild every recipe instead of reusing earlier runs' builds.
+        type: boolean
+        default: false
+      possum-run:
+        description: The URL of the possum-ci run that dispatched this one.
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: ci-${{ inputs.status-sha }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: apps/possum
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - &possum-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: possum-token
+        with:
+          client-id: ${{ secrets.POSSUM_APP_CLIENT_ID }}
+          private-key: ${{ secrets.POSSUM_APP_PRIVATE_KEY }}
+          owner: publicgoodsfunding
+          repositories: www.prosperous.software
+          permission-contents: read
+      - &possum-checkout
+        id: possum-checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: publicgoodsfunding/www.prosperous.software
+          ref: ${{ inputs.sha }}
+          token: ${{ steps.possum-token.outputs.token }}
+          persist-credentials: false
+          sparse-checkout: |
+            /apps/possum/
+            /.github/
+            /pyproject.toml
+            /uv.lock
+          sparse-checkout-cone-mode: false
+      - uses: ./.github/actions/possum-setup
+      - run: uv run ruff check
+      - run: uv run ruff format --check
+      - run: uv run pyright
+      - run: uv run pytest
+      - run: uv run possum validate
+      - run: uv run possum validate eval/cases
+
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      recipes: ${{ steps.plan.outputs.recipes }}
+      builds: ${{ steps.plan.outputs.builds }}
+      unpatched: ${{ steps.plan.outputs.unpatched }}
+    steps:
+      - *possum-token
+      - *possum-checkout
+      - uses: ./.github/actions/possum-setup
+      - id: plan
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: '"$GITHUB_WORKSPACE/.github/scripts/possum-runner-plan.sh"'
+
+  unpatched:
+    name: unpatched ${{ matrix.entry.dir }}
+    needs: plan
+    if: ${{ needs.plan.result == 'success' && needs.plan.outputs.unpatched != '[]' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        entry: ${{ fromJSON(needs.plan.outputs.unpatched) }}
+    steps:
+      - *possum-token
+      - *possum-checkout
+      - uses: ./.github/actions/possum-setup
+      - env:
+          RECIPE: ${{ matrix.entry.dir }}
+        run: uv run possum build "$RECIPE" --unpatched --out out
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.entry.artifact }}
+          path: |
+            apps/possum/out/test-results.json
+            apps/possum/out/build.log
+          if-no-files-found: error
+          retention-days: 14
+      - if: failure()
+        run: tail -n 300 out/build.log
+
+  build:
+    name: build ${{ matrix.entry.dir }}
+    needs: [plan, unpatched]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.builds != '[]' && needs.unpatched.result != 'failure' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        entry: ${{ fromJSON(needs.plan.outputs.builds) }}
+    env:
+      UNPATCHED: ${{ matrix.entry.unpatched_artifact }}
+    steps:
+      - *possum-token
+      - *possum-checkout
+      - uses: ./.github/actions/possum-setup
+      - if: ${{ matrix.entry.unpatched_artifact }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: uv run possum ci-fetch "$UNPATCHED" --into unpatched
+      - env:
+          RECIPE: ${{ matrix.entry.dir }}
+        run: '"$GITHUB_WORKSPACE/.github/scripts/possum-runner-build.sh"'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.entry.artifact }}
+          path: |
+            apps/possum/out/*.deb
+            apps/possum/out/*.rpm
+            apps/possum/out/test-results.json
+            apps/possum/out/build.log
+          if-no-files-found: error
+          retention-days: 14
+      - if: failure()
+        run: tail -n 300 out/build.log
+
+  verify-cves:
+    needs: [plan, unpatched, build]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    runs-on: ubuntu-latest
+    steps:
+      - *possum-token
+      - *possum-checkout
+      - uses: ./.github/actions/possum-setup
+      - env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RECIPES: ${{ needs.plan.outputs.recipes }}
+        run: jq -r '.[].artifact' <<<"$RECIPES" | xargs uv run possum ci-fetch --into artifacts
+      - run: uv run pytest -m network cli/tests/test_verify.py
+      - env:
+          RECIPES: ${{ needs.plan.outputs.recipes }}
+        run: '"$GITHUB_WORKSPACE/.github/scripts/possum-runner-verify-cves.sh"'
+
+  publish-smoke:
+    needs: [plan, unpatched, build]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    runs-on: ubuntu-latest
+    env:
+      POSSUM_URL: http://localhost:8000
+    steps:
+      - *possum-token
+      - *possum-checkout
+      - uses: ./.github/actions/possum-setup
+      - env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RECIPES: ${{ needs.plan.outputs.recipes }}
+        run: jq -r '.[].artifact' <<<"$RECIPES" | xargs uv run possum ci-fetch --into packages
+      - name: Publish with a throwaway key
+        run: '"$GITHUB_WORKSPACE/.github/scripts/possum-runner-publish-smoke.sh"'
+      - name: Check the catalog
+        env:
+          RECIPES: ${{ needs.plan.outputs.recipes }}
+        run: '"$GITHUB_WORKSPACE/.github/scripts/possum-runner-check-catalog.sh"'
+      - name: Serve the tree
+        run: '"$GITHUB_WORKSPACE/.github/scripts/possum-runner-serve.sh"'
+      - name: Install from the README on Debian 12
+        env:
+          DISTRO: debian
+        run: '"$GITHUB_WORKSPACE/.github/scripts/possum-runner-install-readme.sh"'
+      - name: Install from the README on Rocky Linux 9
+        env:
+          DISTRO: rocky
+        run: '"$GITHUB_WORKSPACE/.github/scripts/possum-runner-install-readme.sh"'
+
+  # A run cancelled by a newer one for the same commit must not overwrite that run's status. Inside a job that
+  # always() started, cancelled() stays false, so the check has to be the job's own condition.
+  # ponytail: a cancelled run leaves ci-status as it was, and its run/* branch to sweep.yml
+  ci-status:
+    needs: [ci, plan, unpatched, build, verify-cves, publish-smoke]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # Its first step runs before the checkout creates apps/possum.
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - id: result
+        if: ${{ always() }}
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          OK: >-
+            ${{ needs.ci.result == 'success'
+            && needs.plan.result == 'success'
+            && needs.verify-cves.result == 'success'
+            && needs.publish-smoke.result == 'success'
+            && (needs.unpatched.result == 'success' || (needs.unpatched.result == 'skipped' && needs.plan.outputs.unpatched == '[]'))
+            && (needs.build.result == 'success' || (needs.build.result == 'skipped' && needs.plan.outputs.builds == '[]')) }}
+        # Inline: it runs before the token mint and checkout, so a failure there still logs each job's result.
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+          echo "state=$([ "$OK" = true ] && echo success || echo failure)" >> "$GITHUB_OUTPUT"
+      - *possum-token
+      - *possum-checkout
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: status-token
+        with:
+          client-id: ${{ secrets.POSSUM_APP_CLIENT_ID }}
+          private-key: ${{ secrets.POSSUM_APP_PRIVATE_KEY }}
+          owner: publicgoodsfunding
+          repositories: www.prosperous.software
+          permission-statuses: write
+      - uses: ./.github/actions/possum-runner-status
+        with:
+          token: ${{ steps.status-token.outputs.token }}
+          repository: publicgoodsfunding/www.prosperous.software
+          sha: ${{ inputs.status-sha }}
+          context: ci-status
+          state: ${{ steps.result.outputs.state }}
+          target-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          description: possum-runner CI
+      - name: Delete this run's branch
+        if: ${{ always() && steps.possum-checkout.outcome == 'success' && startsWith(github.ref, 'refs/heads/run/') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: '"$GITHUB_WORKSPACE/.github/scripts/possum-runner-delete-run-branch.sh"'
+      - env:
+          STATE: ${{ steps.result.outputs.state }}
+        run: '[ "$STATE" = success ]'
